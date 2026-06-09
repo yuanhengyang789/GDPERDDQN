@@ -7,14 +7,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 import random
 from collections import deque
 import matplotlib.pyplot as plt
 import time
 from queue import Queue
 from scipy.special import comb
-N_STEPS = 3  # n步引导长度
+import pandas as pd
 
 def generate_map(size=20, obstacle_ratio=0.2):
     def is_path_exists(map_array, start, end):
@@ -66,7 +65,6 @@ def generate_map(size=20, obstacle_ratio=0.2):
 # 超参数配置
 BATCH_SIZE = 64
 GAMMA = 0.9
-EPS_DECAY = 0.99
 MEMORY_SIZE = 10000
 LEARNING_RATE = 0.005
 NUM_EPISODES = 500
@@ -327,17 +325,16 @@ class PrioritizedReplayMemoryV1:
 
     def __len__(self):
         return self.tree.size
-# 定义双经验池类
-class DualPrioritizedReplayMemory:
-    def __init__(self, normal_capacity, elite_capacity, alpha=0.7, elite_threshold=2, p0=0.4, p1=0.5, beta_t=0.4):
-        self.normal_memory = PrioritizedReplayMemoryV1(normal_capacity, alpha)
-        self.elite_memory = PrioritizedReplayMemoryV1(elite_capacity, alpha)
+# 定义双经验池类（普通均匀采样，无优先级）
+class DualReplayMemory:
+    def __init__(self, normal_capacity, elite_capacity, elite_threshold=2, p0=0.4, p1=0.5, beta_t=0.4):
+        self.normal_memory = ReplayMemory(normal_capacity)
+        self.elite_memory = ReplayMemory(elite_capacity)
         self.elite_threshold = elite_threshold
         self.normal_ratio = 0.5  # 初始采样比例
-        self.alpha = alpha
         self.last_indices_type = None
 
-        # 动态调整相关属性（保留必要参数）
+        # 动态调整相关属性
         self.min_ratio = 0.3  # 最小采样比例
         self.max_ratio = 0.8  # 最大采样比例
 
@@ -391,6 +388,13 @@ class DualPrioritizedReplayMemory:
         self.normal_losses = []
         self.elite_losses = []
 
+    def record_losses(self, normal_losses, elite_losses):
+        """记录来自训练循环的损失，用于动态调整采样比例"""
+        if normal_losses:
+            self.normal_losses.extend(normal_losses)
+        if elite_losses:
+            self.elite_losses.extend(elite_losses)
+
     def get_memory_stats(self):
         return {
             'normal_size': len(self.normal_memory),
@@ -398,86 +402,58 @@ class DualPrioritizedReplayMemory:
             'normal_ratio': self.normal_ratio
         }
 
-    def sample(self, batch_size, beta=0.4):
+    def sample(self, batch_size):
         # 如果两个池都是空的，返回空列表
-        if self.normal_memory.tree.size == 0 and self.elite_memory.tree.size == 0:
+        if len(self.normal_memory) == 0 and len(self.elite_memory) == 0:
             self.last_indices_type = "empty"
-            return [], [], np.array([])
-        
+            return [], np.array([])
+
         # 根据比例从两个经验池中抽样
         normal_size = int(batch_size * self.normal_ratio)
         elite_size = batch_size - normal_size
-        
+
         # 确保两个池子都有足够的样本
-        if (self.normal_memory.tree.size < normal_size) and (self.elite_memory.tree.size < elite_size):
-            normal_size = self.normal_memory.tree.size
-            elite_size = self.elite_memory.tree.size
-        
-        if self.normal_memory.tree.size < normal_size:
-            normal_size = self.normal_memory.tree.size
-            elite_size = min(batch_size - normal_size, self.elite_memory.tree.size)
-        
-        if self.elite_memory.tree.size < elite_size:
-            elite_size = self.elite_memory.tree.size
-            normal_size = min(batch_size - elite_size, self.normal_memory.tree.size)
-        
+        if (len(self.normal_memory) < normal_size) and (len(self.elite_memory) < elite_size):
+            normal_size = len(self.normal_memory)
+            elite_size = len(self.elite_memory)
+
+        if len(self.normal_memory) < normal_size:
+            normal_size = len(self.normal_memory)
+            elite_size = min(batch_size - normal_size, len(self.elite_memory))
+
+        if len(self.elite_memory) < elite_size:
+            elite_size = len(self.elite_memory)
+            normal_size = min(batch_size - elite_size, len(self.normal_memory))
+
         # 如果一个池为空，则从另一个池中抽取全部样本
         if normal_size == 0:
             self.last_indices_type = "elite_only"
-            return self.elite_memory.sample(elite_size, beta)
-        
+            batch, _, weights = self.elite_memory.sample(elite_size)
+            self._last_normal_size = 0
+            return batch, weights
+
         if elite_size == 0:
             self.last_indices_type = "normal_only"
-            return self.normal_memory.sample(normal_size, beta)
-        
+            batch, _, weights = self.normal_memory.sample(normal_size)
+            self._last_normal_size = normal_size
+            return batch, weights
+
         # 从两个池中抽样
-        normal_batch, normal_indices, normal_weights = self.normal_memory.sample(normal_size, beta)
-        elite_batch, elite_indices, elite_weights = self.elite_memory.sample(elite_size, beta)
-        
+        normal_batch, _, normal_weights = self.normal_memory.sample(normal_size)
+        elite_batch, _, elite_weights = self.elite_memory.sample(elite_size)
+
         # 合并样本
         batch = normal_batch + elite_batch
-        
-        # 使用两个独立的索引列表
-        self.last_normal_indices = normal_indices
-        self.last_elite_indices = elite_indices
         self.last_indices_type = "mixed"
-        
+        self._last_normal_size = normal_size
+
         # 合并权重
         weights = np.concatenate((normal_weights, elite_weights))
-        
-        return batch, (normal_indices, elite_indices), weights
 
-    def update_priorities(self, indices, priorities):
-        if self.last_indices_type == "empty":
-            return
-        
-        if self.last_indices_type == "normal_only":
-            self.normal_memory.update_priorities(indices, priorities)
-            self.normal_losses.extend(priorities)  # 记录损失
-            return
-        
-        if self.last_indices_type == "elite_only":
-            self.elite_memory.update_priorities(indices, priorities)
-            self.elite_losses.extend(priorities)  # 记录损失
-            return
-        
-        if self.last_indices_type == "mixed":
-            normal_indices, elite_indices = indices
-            normal_size = len(normal_indices)
-            
-            # 分别更新两个池的优先级
-            if len(normal_indices) > 0:
-                normal_priorities = priorities[:normal_size]
-                self.normal_memory.update_priorities(normal_indices, normal_priorities)
-                self.normal_losses.extend(normal_priorities)  # 记录损失
-                
-            if len(elite_indices) > 0:
-                elite_priorities = priorities[normal_size:]
-                self.elite_memory.update_priorities(elite_indices, elite_priorities)
-                self.elite_losses.extend(elite_priorities)  # 记录损失
-    
+        return batch, weights
+
     def __len__(self):
-        return self.normal_memory.tree.size + self.elite_memory.tree.size
+        return len(self.normal_memory) + len(self.elite_memory)
 
 def initialize_q_values(map, target_pos):
     rows, cols = map.shape
@@ -581,9 +557,6 @@ def test_net(policy_net, current_pos, target_pos, step_func):
         current_pos = next_pos
     return path
 
-import matplotlib.pyplot as plt
-import numpy as np
-
 def plot_paths_four(path1, path2, path3, title, start_pos, target_pos, map):
     plt.figure(figsize=(10, 10))
     plt.imshow(map, cmap='gray_r', origin='lower')
@@ -650,10 +623,6 @@ def smooth_path(path, num_points=100):
         return list(zip(y_smooth, x_smooth))
     except:
         return path
-
-def is_valid(pos, size):
-    r, c = pos
-    return 0 <= r < size and 0 <= c < size
 
 def step_v1(current_pos, action, target_pos, visited_positions=None, prev_action=None):
     if visited_positions is None:
@@ -800,7 +769,7 @@ def step_v3(current_pos, action, target_pos, visited_positions=None, prev_action
         return (n_row, n_col), reward, done, visited_positions, prev_actions
 
     return (n_row, n_col), reward, done, visited_positions, prev_actions
-# 优化模型函数（PERDDQN.py版本）
+# 优化模型函数（算法2 PER-DDQN专用）
 def optimize_model_v2(policy_net, target_net, optimizer, memory, beta=0.4):
     if len(memory) < BATCH_SIZE:
         return
@@ -839,86 +808,6 @@ def optimize_model_v2(policy_net, target_net, optimizer, memory, beta=0.4):
     loss.backward()
     optimizer.step()
 
-# 修改优化模型函数，适应算法1双经验池
-def optimize_model_dual(policy_net, target_net, optimizer, memory, beta=0.4):
-    if len(memory) < BATCH_SIZE:
-        return
-    batch, indices, weights = memory.sample(BATCH_SIZE, beta)
-    
-    if not batch:  # 如果抽样为空则返回
-        return
-    # 添加类型检查
-    for item in batch:
-        if not isinstance(item, tuple) or len(item) != 5:
-            print(f"警告：发现无效的样本格式: {item}")
-            return
-    try:
-        state_batch = torch.cat([item[0].to(device) for item in batch])
-        action_batch = torch.tensor([item[1] for item in batch], device=device).unsqueeze(1)
-        reward_batch = torch.tensor([item[2] for item in batch], dtype=torch.float32, device=device)
-
-        non_final_mask = torch.tensor([item[3] is not None for item in batch], 
-                                    device=device, dtype=torch.bool)
-        non_final_next_states = torch.cat([item[3] for item in batch 
-                                         if item[3] is not None]).to(device)
-
-        policy_next_q_values = torch.zeros(len(batch), device=device)
-        with torch.no_grad():
-            if len(non_final_next_states) > 0:
-                selected_actions = policy_net(non_final_next_states).max(1)[1]
-                policy_next_q_values[non_final_mask] = target_net(non_final_next_states).gather(
-                    1, selected_actions.unsqueeze(1)
-                ).squeeze()
-
-        target_q_values = reward_batch + (GAMMA * policy_next_q_values)
-        current_q_values = policy_net(state_batch).gather(1, action_batch)
-
-        is_weights = torch.tensor(weights, device=device, dtype=torch.float32)
-        loss = (is_weights * F.mse_loss(current_q_values.squeeze(), target_q_values, reduction='none')).mean()
-
-        priorities = (torch.abs(current_q_values.squeeze() - target_q_values) + 1e-5).detach().cpu().numpy()
-        memory.update_priorities(indices, priorities)
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1)
-        optimizer.step()
-    except Exception as e:
-        print(f"优化过程中出错: {e}")
-        # 继续训练而不中断
-
-def optimize_model_v3(policy_net, target_net, optimizer, memory):
-    if len(memory) < BATCH_SIZE:
-        return
-    transitions, _, _ = memory.sample(BATCH_SIZE)
-    batch = list(zip(*transitions))
-    
-    # 确保使用 float32
-    state_batch = torch.cat(batch[0]).float()
-    action_batch = torch.tensor(batch[1], device=device, dtype=torch.int64).unsqueeze(1)
-    reward_batch = torch.tensor(batch[2], device=device, dtype=torch.float32)
-    non_final_mask = torch.tensor(
-        [s is not None for s in batch[3]],
-        device=device, dtype=torch.bool
-    )
-    # 确保使用 float32
-    non_final_next_states = torch.cat([s for s in batch[3] if s is not None]).float()
-    # 计算当前Q值
-    current_q_values = policy_net(state_batch).gather(1, action_batch)
-    # 计算目标Q值（传统DDQN方式）
-    next_q_values = torch.zeros(BATCH_SIZE, device=device, dtype=torch.float32)
-    with torch.no_grad():
-        if len(non_final_next_states) > 0:
-            next_actions = policy_net(non_final_next_states).max(1)[1].unsqueeze(1)
-            next_q_values[non_final_mask] = target_net(non_final_next_states).gather(1, next_actions).squeeze()
-    # 计算目标Q值
-    target_q_values = reward_batch + GAMMA * next_q_values
-    # 计算损失并更新
-    loss = F.mse_loss(current_q_values.squeeze(), target_q_values)
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1)
-    optimizer.step()
 def run_algorithm_v1():
     policy_net = DQN().to(device)
     target_net = DQN().to(device)
@@ -934,15 +823,13 @@ def run_algorithm_v1():
     min_epsilon = 0.05
     normal_capacity = int(MEMORY_SIZE * 0.6)
     elite_capacity = MEMORY_SIZE - normal_capacity
-    memory = DualPrioritizedReplayMemory(normal_capacity, elite_capacity)
+    memory = DualReplayMemory(normal_capacity, elite_capacity)
     steps_done = 0
     episode_steps = []
     total_rewards = []
     cumulative_times = []
     cumulative_time = 0
-    learning_rates = []
     epsilons = []
-    losses = []
     training_start = time.time()
     for episode in range(NUM_EPISODES):
         episode_start_time = time.time()
@@ -951,8 +838,6 @@ def run_algorithm_v1():
         step_count = 0
         visited_positions = {}
         prev_action = None
-        episode_loss = 0
-        loss_count = 0
         while True:
             state = matrix_to_img(current_pos, map).to(device)
             action = choose_action(state, policy_net, epsilon) 
@@ -963,7 +848,7 @@ def run_algorithm_v1():
             prev_action = action
 
             if steps_done % REPLAY_INTERVAL == 0 and len(memory) >= BATCH_SIZE:
-                batch, indices, weights = memory.sample(BATCH_SIZE, beta=0.4)
+                batch, _ = memory.sample(BATCH_SIZE)
                 if batch:
                     state_batch = torch.cat([item[0].to(device) for item in batch])
                     action_batch = torch.tensor([item[1] for item in batch], device=device).unsqueeze(1)
@@ -977,16 +862,18 @@ def run_algorithm_v1():
                             next_actions = policy_net(non_final_next_states).max(1)[1].unsqueeze(1)
                             next_q_values[non_final_mask] = target_net(non_final_next_states).gather(1, next_actions).squeeze()
                     target_q_values = reward_batch + (GAMMA * next_q_values)
-                    is_weights = torch.tensor(weights, device=device, dtype=torch.float32)
-                    loss = (is_weights * F.smooth_l1_loss(current_q_values.squeeze(), target_q_values, reduction='none')).mean()
-                    priorities = (torch.abs(current_q_values.squeeze() - target_q_values) + 1e-5).detach().cpu().numpy()
-                    memory.update_priorities(indices, priorities)
+                    loss = F.smooth_l1_loss(current_q_values.squeeze(), target_q_values)
+                    # 记录各池损失用于动态采样比例调整
+                    td_errors = torch.abs(current_q_values.squeeze() - target_q_values).detach().cpu().numpy()
+                    normal_size = memory._last_normal_size
+                    memory.record_losses(
+                        td_errors[:normal_size].tolist() if normal_size > 0 else [],
+                        td_errors[normal_size:].tolist() if normal_size < len(batch) else []
+                    )
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1)
                     optimizer.step()
-                    episode_loss += loss.item()
-                    loss_count += 1
                     soft_update(target_net, policy_net, tau=0.01)
             current_pos = next_pos
             step_count += 1
@@ -997,9 +884,6 @@ def run_algorithm_v1():
                 episode_steps.append(step_count)
                 total_rewards.append(total_reward)
                 break
-        # 记录当前学习率
-        current_lr = optimizer.param_groups[0]['lr']
-        learning_rates.append(current_lr)
         if episode < 50:
             epsilon = epsilon
         else:
@@ -1008,16 +892,13 @@ def run_algorithm_v1():
         episode_time = time.time() - episode_start_time
         cumulative_time += episode_time
         cumulative_times.append(cumulative_time)
-        # 记录平均损失
-        avg_loss = episode_loss / loss_count if loss_count > 0 else 0
-        losses.append(avg_loss)
         if episode % 1 == 0:
             stats = memory.get_memory_stats()
             print(f'Algorithm 1 - Episode {episode}, Steps: {step_count}, '
                   f'Reward: {total_reward:.1f}, '
                   f'Elite/Normal: {stats["elite_size"]}/{stats["normal_size"]}, '
                   f'Sampling Ratio: {stats["normal_ratio"]:.2f}/{1-stats["normal_ratio"]:.2f}, '
-                  f'Epsilon: {epsilon:.3f}, LR: {current_lr:.6f}, Loss: {avg_loss:.6f}')
+                  f'Epsilon: {epsilon:.3f}')
     training_duration = time.time() - training_start
     final_path = test_net(policy_net, start_pos, target_pos, step_v1)
     print(f"Algorithm 1 Pretraining Time: {pretrain_duration:.6f} 秒")
@@ -1026,7 +907,6 @@ def run_algorithm_v1():
         total_rewards,
         cumulative_times,
         final_path,
-        learning_rates,
         policy_net,
         epsilons,
         training_duration,
@@ -1212,7 +1092,7 @@ def main():
 
     # 运行三个算法获取训练好的网络
     print("Running Algorithm 1 (G-DPER-DDQN)...")
-    steps1, rewards1, times1, path1, learning_rates1, net1, epsilons1, training_duration1 = run_algorithm_v1()
+    steps1, rewards1, times1, path1, net1, epsilons1, training_duration1 = run_algorithm_v1()
     print(f"算法1运行时间: {training_duration1:.6f} 秒")
 
     # 保存算法1训练好的模型
@@ -1288,7 +1168,7 @@ def main():
     plt.legend()
     plt.show()
 
-    # 路径平滑处理（仅对算法1 G-DPER-DDQN进行B样条平滑）
+    # 路径平滑处理（仅对算法1 G-DPER-DDQN进行贝塞尔曲线平滑）
     smooth_path1 = smooth_path(path1)
 
     # 显示路径对比（算法1使用平滑路径，算法2和3使用原始路径+偏移区分）
@@ -1300,8 +1180,7 @@ def main():
     print(f"PER-DDQN 路径长度: {len(path2)}")
     print(f"ECMS-DDQN 路径长度: {len(path3)}")
 
-# 保存训练数据到CSV文件
-    import pandas as pd
+    # 保存训练数据到CSV文件
     # 创建数据字典
     steps_data = {
         'Episode': range(len(steps1)),
