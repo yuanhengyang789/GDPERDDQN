@@ -13,7 +13,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 import time
 from queue import Queue
-import scipy.interpolate as interpolate
+from scipy.special import comb
 N_STEPS = 3  # n步引导长度
 
 def generate_map(size=20, obstacle_ratio=0.2):
@@ -588,16 +588,16 @@ def plot_paths_four(path1, path2, path3, title, start_pos, target_pos, map):
     plt.figure(figsize=(10, 10))
     plt.imshow(map, cmap='gray_r', origin='lower')
 
-    # 路径平移，避免重叠
-    offset = 0.1
+    # 路径平移，避免重叠（算法2和3使用原始路径，偏移量稍大以区分）
+    offset = 0.15
     # 红色路径向左上偏移
-    plt.plot([p[1]-offset for p in path1], [p[0]-offset for p in path1], 'r-', 
+    plt.plot([p[1]-offset for p in path1], [p[0]-offset for p in path1], 'r-',
              label='G-DPER-DDQN', linewidth=1.5)
-    # 绿色路径不偏移
-    plt.plot([p[1] for p in path2], [p[0] for p in path2], 'g-', 
+    # 绿色路径向右偏移
+    plt.plot([p[1]+offset for p in path2], [p[0] for p in path2], 'g-',
              label='PER-DDQN', linewidth=1.5)
     # 蓝色路径向右下偏移
-    plt.plot([p[1]+offset for p in path3], [p[0]+offset for p in path3], 'b-', 
+    plt.plot([p[1]+offset for p in path3], [p[0]-offset for p in path3], 'b-',
              label='ECMS-DDQN', linewidth=1.5)
 
     # 绘制起点和终点
@@ -624,33 +624,30 @@ def plot_paths_four(path1, path2, path3, title, start_pos, target_pos, map):
     plt.show()
 
 
-def smooth_path(path, k=3, num_points = 100):
-
+def smooth_path(path, num_points=100):
+    """使用贝塞尔曲线对路径进行平滑处理"""
     if len(path) < 4:
         return path
-    
-    # 提取路径点的x和y坐标
+
+    # 提取路径点的x和y坐标（控制点）
     x = [p[1] for p in path]
     y = [p[0] for p in path]
-    
-    # 生成参数化的点
-    t = np.linspace(0, 1, len(x))
-    
-    # 创建B样条对象
+    n = len(x) - 1  # 贝塞尔曲线阶数
+
     try:
-        # x方向的B样条
-        tck_x = interpolate.splrep(t, x, k=min(k, len(x)-1))
-        # y方向的B样条
-        tck_y = interpolate.splrep(t, y, k=min(k, len(y)-1))
-        
-        # 生成平滑路径点
+        # 生成参数t，均匀采样num_points个点
         t_new = np.linspace(0, 1, num_points)
-        x_smooth = interpolate.splev(t_new, tck_x)
-        y_smooth = interpolate.splev(t_new, tck_y)
-        
-        # 将平滑后的坐标点组合成路径
-        smooth_path = list(zip(y_smooth, x_smooth))
-        return smooth_path
+
+        # 计算伯恩斯坦基函数，求和得到贝塞尔曲线
+        t_col = t_new.reshape(-1, 1)           # (num_points, 1)
+        i_row = np.arange(n + 1).reshape(1, -1) # (1, n+1)
+        # 伯恩斯坦基函数 B_{i,n}(t) = C(n,i) * t^i * (1-t)^(n-i)
+        bernstein = comb(n, i_row) * (t_col ** i_row) * ((1 - t_col) ** (n - i_row))
+
+        x_smooth = bernstein @ np.array(x)
+        y_smooth = bernstein @ np.array(y)
+
+        return list(zip(y_smooth, x_smooth))
     except:
         return path
 
@@ -1291,14 +1288,12 @@ def main():
     plt.legend()
     plt.show()
 
-    # 路径平滑处理
+    # 路径平滑处理（仅对算法1 G-DPER-DDQN进行B样条平滑）
     smooth_path1 = smooth_path(path1)
-    smooth_path2 = smooth_path(path2)
-    smooth_path3 = smooth_path(path3)
 
-    # 显示路径对比（使用平滑后的路径）
-    plot_paths_four(smooth_path1, smooth_path2, smooth_path3, 
-                   " Paths Comparison", 
+    # 显示路径对比（算法1使用平滑路径，算法2和3使用原始路径+偏移区分）
+    plot_paths_four(smooth_path1, path2, path3,
+                   " Paths Comparison",
                    start_pos, target_pos, map)
     # 输出三种算法的路径长度
     print(f"G-DPER-DDQN 路径长度: {len(path1)}")
